@@ -1,0 +1,45 @@
+name: Build and Test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: libbhd_decrypter.so
+          - os: windows-latest
+            artifact_name: bhd_decrypter.dll
+          - os: macos-latest
+            artifact_name: libbhd_decrypter.dylib
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (Release)
+        run: cargo build --release
+
+      - name: Run Tests
+        run: cargo test --release
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-binaries
+          path: |
+            target/release/${{ matrix.artifact_name }}
+            target/release/decrypter*
