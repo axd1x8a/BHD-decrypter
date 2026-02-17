@@ -6,30 +6,50 @@ use rayon::{
 use crate::{RsaPublicKey, decrypt_into, parse_pem_public_key};
 use std::slice;
 
+#[repr(C)]
+pub enum Bhderr {
+    Ok = 0,
+    InvalidArg = 1,
+    KeyParse = 2,
+    Utf8 = 3,
+    OutputTooSmall = 4,
+    Internal = 5,
+}
+
 /// # Safety
 ///
 /// * `pem_ptr` must point to a valid allocation of at least `pem_len` bytes.
-/// * The memory pointed to by `pem_ptr` must not be modified for the duration of this call.
-/// * Returns a null pointer if the PEM is invalid UTF-8 or fails to parse as an RSA key.
-/// * **Ownership:** The caller owns the returned pointer and MUST free it using `bhd_key_free`.
+/// * `out_key` must be a valid pointer to receive the key handle.
+/// * **Ownership:** The caller owns the output handle and MUST free it using `bhd_key_free`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bhd_key_new(pem_ptr: *const u8, pem_len: usize) -> *mut RsaPublicKey {
+pub unsafe extern "C" fn bhd_key_new(
+    pem_ptr: *const u8,
+    pem_len: usize,
+    out_key: *mut *mut RsaPublicKey,
+) -> i32 {
+    if pem_ptr.is_null() || out_key.is_null() {
+        return Bhderr::InvalidArg as i32;
+    }
+
     let pem_bytes = unsafe { slice::from_raw_parts(pem_ptr, pem_len) };
-    let Ok(pem_str) = std::str::from_utf8(pem_bytes) else {
-        return std::ptr::null_mut();
+
+    let pem_str = match std::str::from_utf8(pem_bytes) {
+        Ok(s) => s,
+        Err(_) => return Bhderr::Utf8 as i32,
     };
 
     match parse_pem_public_key(pem_str) {
-        Ok(key) => Box::into_raw(Box::new(key)),
-        Err(_) => std::ptr::null_mut(),
+        Ok(key) => {
+            unsafe { *out_key = Box::into_raw(Box::new(key)) };
+            Bhderr::Ok as i32
+        }
+        Err(_) => Bhderr::KeyParse as i32,
     }
 }
 
 /// # Safety
 ///
 /// * `key_ptr` must be a valid pointer obtained from `bhd_key_new`.
-/// * This function must only be called ONCE per pointer.
-/// * After this call, the `key_ptr` is invalid and must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bhd_key_free(key_ptr: *mut RsaPublicKey) {
     if !key_ptr.is_null() {
@@ -41,46 +61,81 @@ pub unsafe extern "C" fn bhd_key_free(key_ptr: *mut RsaPublicKey) {
 /// # Safety
 ///
 /// * `key_ptr` must be a valid, non-null pointer to an `RsaPublicKey`.
+/// * `out_size` must be a valid pointer to receive the size.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bhd_get_size(key_ptr: *const RsaPublicKey, encrypted_len: usize) -> usize {
-    let key = unsafe { &*key_ptr };
-    if encrypted_len < key.size {
-        return encrypted_len;
+pub unsafe extern "C" fn bhd_get_size(
+    key_ptr: *const RsaPublicKey,
+    encrypted_len: usize,
+    out_size: *mut usize,
+) -> i32 {
+    if key_ptr.is_null() || out_size.is_null() {
+        return Bhderr::InvalidArg as i32;
     }
-    encrypted_len.div_ceil(key.size) * (key.size - 1)
+
+    let key = unsafe { &*key_ptr };
+    let size = if encrypted_len < key.size {
+        encrypted_len
+    } else {
+        encrypted_len.div_ceil(key.size) * (key.size - 1)
+    };
+
+    unsafe { *out_size = size };
+    Bhderr::Ok as i32
 }
 
 /// # Safety
 ///
-/// * `key_ptr` must be a valid, non-null pointer to an `RsaPublicKey`.
+/// * `key_ptr` must be a valid pointer to an `RsaPublicKey`.
 /// * `data_ptr` must point to at least `data_len` valid bytes.
-/// * `out_ptr` must point to a writable buffer allocated with at least the size
-///   returned by `bhd_get_size`.
-/// * The buffers pointed to by `data_ptr` and `out_ptr` must not overlap.
+/// * `out_ptr` must point to a writable buffer of at least `out_cap` bytes.
+/// * `out_written` must be a valid pointer to receive the bytes written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bhd_decrypt(
     key_ptr: *const RsaPublicKey,
     data_ptr: *const u8,
     data_len: usize,
     out_ptr: *mut u8,
-) -> usize {
+    out_cap: usize,
+    out_written: *mut usize,
+) -> i32 {
+    if key_ptr.is_null()
+        || out_written.is_null()
+        || (data_len > 0 && data_ptr.is_null())
+        || (out_cap > 0 && out_ptr.is_null())
+    {
+        return Bhderr::InvalidArg as i32;
+    }
+
     let key = unsafe { &*key_ptr };
     let data = unsafe { slice::from_raw_parts(data_ptr, data_len) };
 
-    // FIX: Match the CLI's early exit for small/unencrypted files.
-    // If we don't do this, FFI tries to decrypt raw plaintext and outputs garbage.
-    if data_len < key.size {
-        let out_slice = unsafe { slice::from_raw_parts_mut(out_ptr, data_len) };
-        out_slice.copy_from_slice(data);
-        return data_len;
+    let required_size = if data_len < key.size {
+        data_len
+    } else {
+        data_len.div_ceil(key.size) * (key.size - 1)
+    };
+
+    if out_cap < required_size {
+        return Bhderr::OutputTooSmall as i32;
     }
 
-    let out_size = unsafe { bhd_get_size(key_ptr, data_len) };
-    let out_slice = unsafe { slice::from_raw_parts_mut(out_ptr, out_size) };
+    if required_size == 0 {
+        unsafe { *out_written = 0 };
+        return Bhderr::Ok as i32;
+    }
+
+    let out_slice = unsafe { slice::from_raw_parts_mut(out_ptr, required_size) };
+
+    if data_len < key.size {
+        out_slice.copy_from_slice(data);
+        unsafe { *out_written = data_len };
+        return Bhderr::Ok as i32;
+    }
 
     run_decryption(data, out_slice, key, key.size, key.size - 1);
 
-    out_size
+    unsafe { *out_written = required_size };
+    Bhderr::Ok as i32
 }
 
 fn run_decryption(
